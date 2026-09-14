@@ -27,7 +27,7 @@ ADMIN_IDS = {7921719616}
 
 MOVIES_FILE = Path("movies.json")
 STATS_FILE = Path("stats.json")
-WEB_PORT = int(os.getenv("BOT_WEB_PORT", "8080"))
+WEB_PORT = int(os.getenv("PORT", "5000"))
 
 web_app = Flask(__name__)
 
