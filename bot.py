@@ -647,11 +647,12 @@ async def add_required_channel(
         await update.message.reply_text("Sizda bu buyruqni ishlatish huquqi yo‘q.")
         return ConversationHandler.END
 
-    if len(context.args) > 1:
+    args = context.args or []
+    if len(args) > 1:
         await update.message.reply_text("Foydalanish: /kanalqoshish @channelusername")
         return ConversationHandler.END
-    if len(context.args) == 1:
-        await change_required_channel(update, context.args[0], adding=True)
+    if len(args) == 1:
+        await change_required_channel(update, args[0], adding=True)
         return ConversationHandler.END
 
     await update.message.reply_text(
@@ -675,11 +676,12 @@ async def remove_required_channel(
         await update.message.reply_text("Sizda bu buyruqni ishlatish huquqi yo‘q.")
         return ConversationHandler.END
 
-    if len(context.args) > 1:
+    args = context.args or []
+    if len(args) > 1:
         await update.message.reply_text("Foydalanish: /kanalochir @channelusername")
         return ConversationHandler.END
-    if len(context.args) == 1:
-        await change_required_channel(update, context.args[0], adding=False)
+    if len(args) == 1:
+        await change_required_channel(update, args[0], adding=False)
         return ConversationHandler.END
 
     await update.message.reply_text(
