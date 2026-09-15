@@ -14,6 +14,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.error import TelegramError
@@ -47,6 +48,7 @@ CONFIRMING_BROADCAST = 2
 WAITING_FOR_ADD_CODE = 3
 WAITING_FOR_ADD_CHANNEL = 4
 WAITING_FOR_REMOVE_CHANNEL = 5
+CONFIRMING_ADMIN_INPUT = 6
 
 ADMIN_ADD_CODE_BUTTON = "🎬 Kod qo'shish"
 ADMIN_LIST_CODES_BUTTON = "📁 Kodlar ro'yxati"
@@ -55,6 +57,11 @@ ADMIN_BROADCAST_BUTTON = "📢 Xabar yuborish"
 ADMIN_ADD_CHANNEL_BUTTON = "➕ Kanal qo'shish"
 ADMIN_REMOVE_CHANNEL_BUTTON = "➖ Kanal o'chirish"
 ADMIN_LIST_CHANNELS_BUTTON = "📋 Kanallar ro'yxati"
+ADMIN_CANCEL_BUTTON = "❌ Bekor qilish"
+
+ADMIN_INPUT_CONFIRM = "admin_input_confirm"
+ADMIN_INPUT_CANCEL = "admin_input_cancel"
+ADMIN_PENDING_KEY = "admin_pending_action"
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +272,42 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def admin_cancel_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[ADMIN_CANCEL_BUTTON]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def admin_input_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Tasdiqlash",
+                    callback_data=ADMIN_INPUT_CONFIRM,
+                ),
+                InlineKeyboardButton(
+                    "❌ Bekor qilish",
+                    callback_data=ADMIN_INPUT_CANCEL,
+                ),
+            ]
+        ]
+    )
+
+
+async def show_admin_input_confirmation(message: Any, value: str | int) -> None:
+    await message.reply_text(
+        "Tasdiqlash uchun quyidagi tugmalardan foydalaning:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await message.reply_text(
+        f"Bu qiymat saqlansinmi?\n{value}",
+        reply_markup=admin_input_confirmation_keyboard(),
+    )
+
+
 async def get_missing_required_channels(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
@@ -454,6 +497,8 @@ def get_forwarded_storage_message(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop(ADMIN_PENDING_KEY, None)
+    context.user_data.pop(BROADCAST_PENDING_KEY, None)
     if update.message:
         stats = load_stats()
         record_user_interaction(stats, update)
@@ -511,16 +556,21 @@ async def find_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
 
-async def save_code_from_reply(update: Update, code: str) -> bool:
+async def get_storage_message_id_from_reply(
+    update: Update,
+    *,
+    reply_markup: ReplyKeyboardMarkup | ReplyKeyboardRemove | None = None,
+) -> int | None:
     if not update.message:
-        return False
+        return None
 
     replied_message = update.message.reply_to_message
     if replied_message is None:
         await update.message.reply_text(
-            "Bu buyruqni storage kanalidan forward qilingan xabarga reply qilib yuboring."
+            "Bu buyruqni storage kanalidan forward qilingan xabarga reply qilib yuboring.",
+            reply_markup=reply_markup,
         )
-        return False
+        return None
 
     source_chat_id, original_message_id = get_forwarded_storage_message(
         replied_message
@@ -530,8 +580,17 @@ async def save_code_from_reply(update: Update, code: str) -> bool:
         or not isinstance(original_message_id, int)
     ):
         await update.message.reply_text(
-            "Faqat storage kanalidan forward qilingan xabarga reply qiling."
+            "Faqat storage kanalidan forward qilingan xabarga reply qiling.",
+            reply_markup=reply_markup,
         )
+        return None
+
+    return original_message_id
+
+
+async def save_code_from_reply(update: Update, code: str) -> bool:
+    original_message_id = await get_storage_message_id_from_reply(update)
+    if original_message_id is None:
         return False
 
     movies = load_movies()
@@ -541,23 +600,8 @@ async def save_code_from_reply(update: Update, code: str) -> bool:
     return True
 
 
-async def add_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-
-    stats = load_stats()
-    record_user_interaction(stats, update)
-    save_stats(stats)
-
-    if not is_admin(update):
-        await update.message.reply_text("Sizda bu buyruqni ishlatish huquqi yo‘q.")
-        return
-
-    if len(context.args) != 1:
-        await update.message.reply_text("Foydalanish: /addcode CODE")
-        return
-
-    await save_code_from_reply(update, context.args[0].strip().upper())
+async def add_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await start_add_code_from_menu(update, context)
 
 
 async def list_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -632,6 +676,47 @@ async def change_required_channel(
     await update.message.reply_text(f"{channel} majburiy kanallar ro‘yxatidan o‘chirildi.")
 
 
+async def prepare_required_channel_confirmation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    channel_value: str,
+    *,
+    adding: bool,
+) -> int:
+    if not update.message:
+        return ConversationHandler.END
+
+    channel = normalize_channel(channel_value)
+    if channel is None:
+        await update.message.reply_text(
+            "Kanal username yoki ID sini yuboring (masalan: @kanal).",
+            reply_markup=admin_cancel_keyboard(),
+        )
+        return WAITING_FOR_ADD_CHANNEL if adding else WAITING_FOR_REMOVE_CHANNEL
+
+    channels = load_channels()
+    if adding and channel in channels:
+        await update.message.reply_text(
+            f"{channel} allaqachon ro‘yxatda.",
+            reply_markup=admin_cancel_keyboard(),
+        )
+        return WAITING_FOR_ADD_CHANNEL
+
+    if not adding and channel not in channels:
+        await update.message.reply_text(
+            f"{channel} ro‘yxatda topilmadi.",
+            reply_markup=admin_cancel_keyboard(),
+        )
+        return WAITING_FOR_REMOVE_CHANNEL
+
+    context.user_data[ADMIN_PENDING_KEY] = {
+        "action": "add_channel" if adding else "remove_channel",
+        "value": channel,
+    }
+    await show_admin_input_confirmation(update.message, channel)
+    return CONFIRMING_ADMIN_INPUT
+
+
 async def add_required_channel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -647,16 +732,9 @@ async def add_required_channel(
         await update.message.reply_text("Sizda bu buyruqni ishlatish huquqi yo‘q.")
         return ConversationHandler.END
 
-    args = context.args or []
-    if len(args) > 1:
-        await update.message.reply_text("Foydalanish: /kanalqoshish @channelusername")
-        return ConversationHandler.END
-    if len(args) == 1:
-        await change_required_channel(update, args[0], adding=True)
-        return ConversationHandler.END
-
     await update.message.reply_text(
-        "Majburiy kanal username yoki ID sini yuboring (masalan: @kanal):"
+        "Kanal username kiriting:",
+        reply_markup=admin_cancel_keyboard(),
     )
     return WAITING_FOR_ADD_CHANNEL
 
@@ -676,16 +754,9 @@ async def remove_required_channel(
         await update.message.reply_text("Sizda bu buyruqni ishlatish huquqi yo‘q.")
         return ConversationHandler.END
 
-    args = context.args or []
-    if len(args) > 1:
-        await update.message.reply_text("Foydalanish: /kanalochir @channelusername")
-        return ConversationHandler.END
-    if len(args) == 1:
-        await change_required_channel(update, args[0], adding=False)
-        return ConversationHandler.END
-
     await update.message.reply_text(
-        "O‘chiriladigan kanal username yoki ID sini yuboring (masalan: @kanal):"
+        "Kanal username kiriting:",
+        reply_markup=admin_cancel_keyboard(),
     )
     return WAITING_FOR_REMOVE_CHANNEL
 
@@ -719,7 +790,6 @@ async def start_add_code_from_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    del context
     if not update.message:
         return ConversationHandler.END
 
@@ -731,8 +801,8 @@ async def start_add_code_from_menu(
     record_user_interaction(stats, update)
     save_stats(stats)
     await update.message.reply_text(
-        "Kino kodini storage kanalidan forward qilingan xabarga reply qilib yuboring "
-        "(masalan: KINO001):"
+        "Kod kiriting:",
+        reply_markup=admin_cancel_keyboard(),
     )
     return WAITING_FOR_ADD_CODE
 
@@ -741,12 +811,12 @@ async def receive_add_code_from_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    del context
     if not update.message or not is_admin(update):
         return ConversationHandler.END
     if not update.message.text:
         await update.message.reply_text(
-            "Kino kodini storage kanalidan forward qilingan xabarga reply qilib yuboring."
+            "Kod kiriting:",
+            reply_markup=admin_cancel_keyboard(),
         )
         return WAITING_FOR_ADD_CODE
 
@@ -754,52 +824,78 @@ async def receive_add_code_from_menu(
     parts = text.split()
     if parts and parts[0].lower().split("@", 1)[0] == "/addcode":
         if len(parts) != 2:
-            await update.message.reply_text("Kodni yuboring (masalan: KINO001).")
+            await update.message.reply_text(
+                "Kodni yuboring (masalan: KINO001).",
+                reply_markup=admin_cancel_keyboard(),
+            )
             return WAITING_FOR_ADD_CODE
         code = parts[1].strip().upper()
     else:
         code = text.upper()
 
     if not code:
-        await update.message.reply_text("Kodni yuboring (masalan: KINO001).")
+        await update.message.reply_text(
+            "Kodni yuboring (masalan: KINO001).",
+            reply_markup=admin_cancel_keyboard(),
+        )
         return WAITING_FOR_ADD_CODE
 
-    saved = await save_code_from_reply(update, code)
-    return ConversationHandler.END if saved else WAITING_FOR_ADD_CODE
+    original_message_id = await get_storage_message_id_from_reply(
+        update,
+        reply_markup=admin_cancel_keyboard(),
+    )
+    if original_message_id is None:
+        return WAITING_FOR_ADD_CODE
+
+    context.user_data[ADMIN_PENDING_KEY] = {
+        "action": "add_code",
+        "value": code,
+        "message_id": original_message_id,
+    }
+    await show_admin_input_confirmation(update.message, code)
+    return CONFIRMING_ADMIN_INPUT
 
 
 async def receive_add_channel_from_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    del context
     if not update.message or not is_admin(update):
         return ConversationHandler.END
     if not update.message.text:
         await update.message.reply_text(
-            "Kanal username yoki ID sini yuboring (masalan: @kanal)."
+            "Kanal username kiriting:",
+            reply_markup=admin_cancel_keyboard(),
         )
         return WAITING_FOR_ADD_CHANNEL
 
-    await change_required_channel(update, update.message.text, adding=True)
-    return ConversationHandler.END
+    return await prepare_required_channel_confirmation(
+        update,
+        context,
+        update.message.text,
+        adding=True,
+    )
 
 
 async def receive_remove_channel_from_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    del context
     if not update.message or not is_admin(update):
         return ConversationHandler.END
     if not update.message.text:
         await update.message.reply_text(
-            "Kanal username yoki ID sini yuboring (masalan: @kanal)."
+            "Kanal username kiriting:",
+            reply_markup=admin_cancel_keyboard(),
         )
         return WAITING_FOR_REMOVE_CHANNEL
 
-    await change_required_channel(update, update.message.text, adding=False)
-    return ConversationHandler.END
+    return await prepare_required_channel_confirmation(
+        update,
+        context,
+        update.message.text,
+        adding=False,
+    )
 
 
 async def admin_menu_list_codes(
@@ -823,6 +919,142 @@ async def admin_menu_list_channels(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
     await list_required_channels(update, context)
+    return ConversationHandler.END
+
+
+async def confirm_admin_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    query = update.callback_query
+    if query is None:
+        return ConversationHandler.END
+
+    if not is_admin(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo‘q.", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+    pending = context.user_data.pop(ADMIN_PENDING_KEY, None)
+    if not isinstance(pending, dict):
+        await query.edit_message_reply_markup(reply_markup=None)
+        if query.message:
+            await query.message.reply_text(
+                "Saqlanadigan qiymat topilmadi.",
+                reply_markup=admin_reply_keyboard(),
+            )
+        return ConversationHandler.END
+
+    action = pending.get("action")
+    value = pending.get("value")
+    if not isinstance(action, str) or not isinstance(value, (str, int)):
+        await query.edit_message_reply_markup(reply_markup=None)
+        if query.message:
+            await query.message.reply_text(
+                "Saqlanadigan qiymat topilmadi.",
+                reply_markup=admin_reply_keyboard(),
+            )
+        return ConversationHandler.END
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+
+    result_message = "Amal bajarildi."
+    if action == "add_code":
+        message_id = pending.get("message_id")
+        if not isinstance(value, str) or not isinstance(message_id, int):
+            result_message = "Kodni saqlab bo‘lmadi."
+        else:
+            movies = load_movies()
+            movies[value] = {"message_id": message_id}
+            save_movies(movies)
+            result_message = f"{value} kodi saqlandi."
+    elif action in {"add_channel", "remove_channel"}:
+        if not isinstance(value, (str, int)):
+            result_message = "Kanalni o‘zgartirib bo‘lmadi."
+        else:
+            channels = load_channels()
+            if action == "add_channel":
+                if value in channels:
+                    result_message = f"{value} allaqachon ro‘yxatda."
+                else:
+                    channels.append(value)
+                    save_channels(channels)
+                    result_message = (
+                        f"{value} majburiy kanal sifatida qo‘shildi."
+                    )
+            elif value not in channels:
+                result_message = f"{value} ro‘yxatda topilmadi."
+            else:
+                channels.remove(value)
+                save_channels(channels)
+                result_message = (
+                    f"{value} majburiy kanallar ro‘yxatidan o‘chirildi."
+                )
+
+    if query.message:
+        await query.message.reply_text(
+            result_message,
+            reply_markup=admin_reply_keyboard(),
+        )
+    return ConversationHandler.END
+
+
+async def cancel_admin_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    query = update.callback_query
+    if query is None:
+        return ConversationHandler.END
+
+    if not is_admin(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo‘q.", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+    context.user_data.pop(ADMIN_PENDING_KEY, None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+    if query.message:
+        await query.message.reply_text(
+            "Amal bekor qilindi.",
+            reply_markup=admin_reply_keyboard(),
+        )
+    return ConversationHandler.END
+
+
+async def cancel_admin_reply_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if update.message:
+        context.user_data.pop(ADMIN_PENDING_KEY, None)
+        await update.message.reply_text(
+            "Amal bekor qilindi.",
+            reply_markup=admin_reply_keyboard(),
+        )
+    return ConversationHandler.END
+
+
+async def cancel_pending_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    context.user_data.pop(ADMIN_PENDING_KEY, None)
+    context.user_data.pop(BROADCAST_PENDING_KEY, None)
+    command_text = update.message.text if update.message else ""
+    if command_text and command_text.split()[0].lower().split("@", 1)[0] == "/start":
+        await start(update, context)
+    elif update.message:
+        await update.message.reply_text(
+            "Amal bekor qilindi.",
+            reply_markup=admin_reply_keyboard() if is_admin(update) else None,
+        )
     return ConversationHandler.END
 
 
@@ -1092,6 +1324,7 @@ def main() -> None:
                 filters.Regex(f"^{ADMIN_ADD_CODE_BUTTON}$"),
                 start_add_code_from_menu,
             ),
+            CommandHandler("addcode", add_code),
             MessageHandler(
                 filters.Regex(f"^{ADMIN_LIST_CODES_BUTTON}$"),
                 admin_menu_list_codes,
@@ -1107,9 +1340,11 @@ def main() -> None:
         ],
         states={
             WAITING_FOR_BROADCAST_MESSAGE: [
+                MessageHandler(filters.COMMAND, cancel_pending_command),
                 MessageHandler(filters.ALL, receive_broadcast_message),
             ],
             CONFIRMING_BROADCAST: [
+                MessageHandler(filters.COMMAND, cancel_pending_command),
                 CallbackQueryHandler(
                     confirm_broadcast,
                     pattern=f"^{BROADCAST_CONFIRM}$",
@@ -1120,20 +1355,45 @@ def main() -> None:
                 ),
             ],
             WAITING_FOR_ADD_CODE: [
+                MessageHandler(
+                    filters.Regex(f"^{ADMIN_CANCEL_BUTTON}$"),
+                    cancel_admin_reply_action,
+                ),
+                MessageHandler(filters.COMMAND, cancel_pending_command),
                 MessageHandler(filters.ALL, receive_add_code_from_menu),
             ],
             WAITING_FOR_ADD_CHANNEL: [
+                MessageHandler(
+                    filters.Regex(f"^{ADMIN_CANCEL_BUTTON}$"),
+                    cancel_admin_reply_action,
+                ),
+                MessageHandler(filters.COMMAND, cancel_pending_command),
                 MessageHandler(filters.ALL, receive_add_channel_from_menu),
             ],
             WAITING_FOR_REMOVE_CHANNEL: [
+                MessageHandler(
+                    filters.Regex(f"^{ADMIN_CANCEL_BUTTON}$"),
+                    cancel_admin_reply_action,
+                ),
+                MessageHandler(filters.COMMAND, cancel_pending_command),
                 MessageHandler(filters.ALL, receive_remove_channel_from_menu),
             ],
+            CONFIRMING_ADMIN_INPUT: [
+                MessageHandler(filters.COMMAND, cancel_pending_command),
+                CallbackQueryHandler(
+                    confirm_admin_input,
+                    pattern=f"^{ADMIN_INPUT_CONFIRM}$",
+                ),
+                CallbackQueryHandler(
+                    cancel_admin_input,
+                    pattern=f"^{ADMIN_INPUT_CANCEL}$",
+                ),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_broadcast_command)],
+        fallbacks=[MessageHandler(filters.COMMAND, cancel_pending_command)],
     )
     application.add_handler(broadcast_handler)
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("addcode", add_code))
     application.add_handler(CommandHandler("listcodes", list_codes))
     application.add_handler(CommandHandler("statistik", statistics))
     application.add_handler(CommandHandler("kanallar", list_required_channels))
