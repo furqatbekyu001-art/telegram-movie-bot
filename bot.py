@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 from threading import Thread
@@ -9,12 +11,17 @@ from telegram import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Update,
 )
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -28,6 +35,14 @@ ADMIN_IDS = {7921719616}
 MOVIES_FILE = Path("movies.json")
 STATS_FILE = Path("stats.json")
 WEB_PORT = int(os.getenv("PORT", "5000"))
+BROADCAST_DELAY_SECONDS = 0.1
+BROADCAST_PENDING_KEY = "broadcast_pending"
+BROADCAST_CONFIRM = "broadcast_confirm"
+BROADCAST_CANCEL = "broadcast_cancel"
+WAITING_FOR_BROADCAST_MESSAGE = 1
+CONFIRMING_BROADCAST = 2
+
+logger = logging.getLogger(__name__)
 
 web_app = Flask(__name__)
 
@@ -172,6 +187,22 @@ def format_statistics(stats: dict[str, Any]) -> str:
 def is_admin(update: Update) -> bool:
     user = update.effective_user
     return user is not None and user.id in ADMIN_IDS
+
+
+def is_forwarded_message(message: Any) -> bool:
+    """Return whether a message was forwarded from another chat or user."""
+    if getattr(message, "forward_origin", None) is not None:
+        return True
+
+    return any(
+        getattr(message, attribute, None) is not None
+        for attribute in (
+            "forward_from",
+            "forward_from_chat",
+            "forward_sender_name",
+            "forward_signature",
+        )
+    )
 
 
 def get_forwarded_storage_message(
@@ -322,6 +353,207 @@ async def statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(format_statistics(stats))
 
 
+def broadcast_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Tasdiqlash",
+                    callback_data=BROADCAST_CONFIRM,
+                ),
+                InlineKeyboardButton(
+                    "❌ Bekor qilish",
+                    callback_data=BROADCAST_CANCEL,
+                ),
+            ]
+        ]
+    )
+
+
+async def show_broadcast_preview(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    source_chat_id: int,
+    source_message_id: int,
+) -> bool:
+    """Copy the pending message back to the admin with confirmation buttons."""
+    context.user_data[BROADCAST_PENDING_KEY] = (
+        source_chat_id,
+        source_message_id,
+    )
+
+    try:
+        await context.bot.copy_message(
+            chat_id=source_chat_id,
+            from_chat_id=source_chat_id,
+            message_id=source_message_id,
+            reply_markup=broadcast_keyboard(),
+        )
+    except Exception as error:
+        context.user_data.pop(BROADCAST_PENDING_KEY, None)
+        logger.warning("Could not create broadcast preview: %s", error)
+        if update.message:
+            await update.message.reply_text(
+                "Bu xabarni preview qilib bo‘lmadi. Boshqa xabar yuboring."
+            )
+        return False
+
+    return True
+
+
+async def start_broadcast(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if not update.message:
+        return ConversationHandler.END
+
+    stats = load_stats()
+    record_user_interaction(stats, update)
+    save_stats(stats)
+
+    if not is_admin(update):
+        await update.message.reply_text("Sizda bu buyruqni ishlatish huquqi yo‘q.")
+        return ConversationHandler.END
+
+    replied_message = update.message.reply_to_message
+    source_chat_id = update.message.chat_id
+    if (
+        replied_message is not None
+        and is_forwarded_message(replied_message)
+        and isinstance(source_chat_id, int)
+    ):
+        preview_created = await show_broadcast_preview(
+            update,
+            context,
+            source_chat_id,
+            replied_message.message_id,
+        )
+        return CONFIRMING_BROADCAST if preview_created else ConversationHandler.END
+
+    await update.message.reply_text(
+        "Xabaringizni yuboring (matn, rasm, yoki ikkisi birga):"
+    )
+    return WAITING_FOR_BROADCAST_MESSAGE
+
+
+async def receive_broadcast_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    if not update.message or not is_admin(update):
+        return ConversationHandler.END
+
+    source_chat_id = update.message.chat_id
+    if not isinstance(source_chat_id, int):
+        return ConversationHandler.END
+
+    preview_created = await show_broadcast_preview(
+        update,
+        context,
+        source_chat_id,
+        update.message.message_id,
+    )
+    return CONFIRMING_BROADCAST if preview_created else ConversationHandler.END
+
+
+async def confirm_broadcast(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    query = update.callback_query
+    if query is None:
+        return ConversationHandler.END
+
+    if not is_admin(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo‘q.", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+    pending = context.user_data.pop(BROADCAST_PENDING_KEY, None)
+    if (
+        not isinstance(pending, tuple)
+        or len(pending) != 2
+        or not all(isinstance(value, int) for value in pending)
+    ):
+        await query.edit_message_reply_markup(reply_markup=None)
+        if query.message:
+            await query.message.reply_text("Yuboriladigan xabar topilmadi.")
+        return ConversationHandler.END
+
+    source_chat_id, source_message_id = pending
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+
+    stats = load_stats()
+    stored_users = stats.get("unique_users", [])
+    user_ids = list(
+        dict.fromkeys(
+            user["id"]
+            for user in stored_users
+            if isinstance(user, dict) and isinstance(user.get("id"), int)
+        )
+    )
+
+    succeeded = 0
+    failed = 0
+    for user_id in user_ids:
+        try:
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=source_chat_id,
+                message_id=source_message_id,
+            )
+            succeeded += 1
+        except Exception as error:
+            failed += 1
+            logger.warning("Broadcast failed for user %s: %s", user_id, error)
+        await asyncio.sleep(BROADCAST_DELAY_SECONDS)
+
+    if query.message:
+        await query.message.reply_text(
+            "Xabar yuborish yakunlandi.\n"
+            f"Muvaffaqiyatli: {succeeded}\n"
+            f"Muvaffaqiyatsiz: {failed}"
+        )
+    return ConversationHandler.END
+
+
+async def cancel_broadcast(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    query = update.callback_query
+    if query is None:
+        return ConversationHandler.END
+
+    if not is_admin(update):
+        await query.answer("Sizda bu amalni bajarish huquqi yo‘q.", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+    context.user_data.pop(BROADCAST_PENDING_KEY, None)
+    if query.message:
+        try:
+            await query.message.delete()
+        except TelegramError:
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text("Xabar bekor qilindi.")
+    return ConversationHandler.END
+
+
+async def cancel_broadcast_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    context.user_data.pop(BROADCAST_PENDING_KEY, None)
+    if update.message:
+        await update.message.reply_text("Xabar bekor qilindi.")
+    return ConversationHandler.END
+
+
 async def configure_command_menu(application: Application) -> None:
     regular_commands = [
         BotCommand("start", "Botni boshlash"),
@@ -331,6 +563,7 @@ async def configure_command_menu(application: Application) -> None:
         BotCommand("addcode", "Kino kodini qo‘shish"),
         BotCommand("listcodes", "Barcha kodlarni ko‘rish"),
         BotCommand("statistik", "Bot statistikasini ko‘rish"),
+        BotCommand("xabar", "Foydalanuvchilarga xabar yuborish"),
     ]
 
     await application.bot.set_my_commands(
@@ -354,6 +587,26 @@ def main() -> None:
         .post_init(configure_command_menu)
         .build()
     )
+    broadcast_handler = ConversationHandler(
+        entry_points=[CommandHandler("xabar", start_broadcast)],
+        states={
+            WAITING_FOR_BROADCAST_MESSAGE: [
+                MessageHandler(filters.ALL, receive_broadcast_message),
+            ],
+            CONFIRMING_BROADCAST: [
+                CallbackQueryHandler(
+                    confirm_broadcast,
+                    pattern=f"^{BROADCAST_CONFIRM}$",
+                ),
+                CallbackQueryHandler(
+                    cancel_broadcast,
+                    pattern=f"^{BROADCAST_CANCEL}$",
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_broadcast_command)],
+    )
+    application.add_handler(broadcast_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("addcode", add_code))
     application.add_handler(CommandHandler("listcodes", list_codes))
